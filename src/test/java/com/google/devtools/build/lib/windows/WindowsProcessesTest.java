@@ -29,6 +29,9 @@ import java.nio.file.Path;
 import java.nio.file.Paths;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicReference;
 import org.junit.After;
 import org.junit.Before;
 import org.junit.Test;
@@ -511,5 +514,69 @@ public class WindowsProcessesTest {
         WindowsProcesses.createProcess(
             mockBinary, mockArgs("W5", "X0"), null, null, null, null);
     assertThat(WindowsProcesses.waitFor(process, 1000)).isEqualTo(1);
+  }
+
+  @Test
+  public void testCloseAndAvailableConcurrently() throws Exception {
+    process =
+        WindowsProcesses.createProcess(mockBinary, mockArgs("W5", "X0"), null, null, null, null);
+    assertNoProcessError();
+    long stdout = WindowsProcesses.getStdout(process);
+
+    int closerCount = 16;
+    int readerCount = 16;
+    CountDownLatch ready = new CountDownLatch(closerCount + readerCount);
+    CountDownLatch start = new CountDownLatch(1);
+    AtomicReference<Throwable> failure = new AtomicReference<>();
+    List<Thread> threads = new ArrayList<>();
+
+    for (int i = 0; i < closerCount; i++) {
+      threads.add(
+          startConcurrentOperation(
+              ready, start, failure, () -> WindowsProcesses.closeStream(stdout)));
+    }
+    for (int i = 0; i < readerCount; i++) {
+      threads.add(
+          startConcurrentOperation(
+              ready,
+              start,
+              failure,
+              () -> {
+                for (int j = 0; j < 1_000; j++) {
+                  int available = WindowsProcesses.streamBytesAvailable(stdout);
+                  if (available < 0) {
+                    throw new AssertionError(WindowsProcesses.streamGetLastError(stdout));
+                  }
+                }
+              }));
+    }
+
+    assertThat(ready.await(10, TimeUnit.SECONDS)).isTrue();
+    start.countDown();
+    for (Thread thread : threads) {
+      thread.join(10_000);
+      assertThat(thread.isAlive()).isFalse();
+    }
+    assertThat(failure.get()).isNull();
+  }
+
+  private static Thread startConcurrentOperation(
+      CountDownLatch ready,
+      CountDownLatch start,
+      AtomicReference<Throwable> failure,
+      Runnable operation) {
+    Thread thread =
+        new Thread(
+            () -> {
+              ready.countDown();
+              try {
+                start.await();
+                operation.run();
+              } catch (Throwable t) {
+                failure.compareAndSet(null, t);
+              }
+            });
+    thread.start();
+    return thread;
   }
 }

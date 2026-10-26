@@ -73,7 +73,7 @@ public class WindowsSubprocess implements Subprocess {
     }
 
     @Override
-    public int available() throws IOException {
+    public synchronized int available() throws IOException {
       if (nativeStream == WindowsProcesses.INVALID) {
         throw new IllegalStateException("Stream already closed");
       }

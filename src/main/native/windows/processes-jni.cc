@@ -21,8 +21,8 @@
 #include <stdint.h>
 #include <wchar.h>
 
-#include <atomic>
 #include <memory>
+#include <mutex>
 #include <sstream>
 #include <string>
 #include <type_traits>  // static_assert
@@ -73,44 +73,55 @@ class JavaByteArray {
 };
 
 class NativeOutputStream {
+ private:
+  enum class DuplicateHandleResult { kSuccess, kClosed, kError };
+
  public:
   NativeOutputStream()
       : handle_(INVALID_HANDLE_VALUE), error_(L""), closed_(false) {}
 
   void Close() {
-    closed_.store(true);
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (closed_) {
+      return;
+    }
+    closed_ = true;
     if (handle_ == INVALID_HANDLE_VALUE) {
       return;
     }
 
-    // CancelIoEx only cancels I/O operations in the current process.
-    // https://msdn.microsoft.com/en-us/library/windows/desktop/aa363792(v=vs.85).aspx
-    //
-    // Therefore if this process bequested `handle_` to a child process, we
-    // cannot cancel I/O in the child process.
-    CancelIoEx(handle_, nullptr);
     CloseHandle(handle_);
     handle_ = INVALID_HANDLE_VALUE;
   }
 
-  void SetHandle(HANDLE handle) { handle_ = handle; }
+  void SetHandle(HANDLE handle) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    handle_ = handle;
+  }
 
   jint StreamBytesAvailable(JNIEnv* env) {
-    if (closed_.load() || handle_ == INVALID_HANDLE_VALUE) {
-      error_ = L"";
+    HANDLE handle;
+    DuplicateHandleResult duplicate_result =
+        DuplicateHandleForOperation(&handle);
+    if (duplicate_result != DuplicateHandleResult::kSuccess) {
+      if (duplicate_result == DuplicateHandleResult::kError) {
+        return -1;
+      }
       return 0;
     }
 
     DWORD avail = 0;
-    if (!::PeekNamedPipe(handle_, nullptr, 0, nullptr, &avail, nullptr)) {
-      // Check if either the other end closed the pipe or we did it with
-      // NativeOutputStream.Close() . In the latter case, we'll get a "system
-      // call interrupted" error.
-      if (GetLastError() == ERROR_BROKEN_PIPE || closed_.load()) {
+    bool success = ::PeekNamedPipe(handle, nullptr, 0, nullptr, &avail, nullptr);
+    DWORD err_code = success ? ERROR_SUCCESS : GetLastError();
+    CloseHandle(handle);
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (!success) {
+      // Treat a concurrently closed stream and the child's broken pipe as
+      // end-of-file.
+      if (err_code == ERROR_BROKEN_PIPE || closed_) {
         error_ = L"";
         return 0;
       } else {
-        DWORD err_code = GetLastError();
         error_ = bazel::windows::MakeErrorMessage(WSTR(__FILE__), __LINE__,
                                                   L"nativeStreamBytesAvailable",
                                                   L"", err_code);
@@ -126,29 +137,37 @@ class NativeOutputStream {
                   jint length) {
     JavaByteArray bytes(env, java_bytes);
     if (offset < 0 || length <= 0 || offset > bytes.size() - length) {
+      std::lock_guard<std::mutex> lock(mutex_);
       error_ = bazel::windows::MakeErrorMessage(WSTR(__FILE__), __LINE__,
                                                 L"nativeReadStream", L"",
                                                 L"Array index out of bounds");
       return -1;
     }
 
-    if (handle_ == INVALID_HANDLE_VALUE || closed_.load()) {
-      error_ = L"";
+    HANDLE handle;
+    DuplicateHandleResult duplicate_result =
+        DuplicateHandleForOperation(&handle);
+    if (duplicate_result != DuplicateHandleResult::kSuccess) {
+      if (duplicate_result == DuplicateHandleResult::kError) {
+        return -1;
+      }
       return 0;
     }
 
     DWORD bytes_read;
-    if (!::ReadFile(handle_, bytes.ptr() + offset, length, &bytes_read,
-                    nullptr)) {
-      // Check if either the other end closed the pipe or we did it with
-      // NativeOutputStream.Close() . In the latter case, we'll get a "system
-      // call interrupted" error.
-      if (GetLastError() == ERROR_BROKEN_PIPE || closed_.load()) {
+    bool success =
+        ::ReadFile(handle, bytes.ptr() + offset, length, &bytes_read, nullptr);
+    DWORD err_code = success ? ERROR_SUCCESS : GetLastError();
+    CloseHandle(handle);
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (!success) {
+      // Treat a concurrently closed stream and the child's broken pipe as
+      // end-of-file.
+      if (err_code == ERROR_BROKEN_PIPE || closed_) {
         // End of file.
         error_ = L"";
         bytes_read = 0;
       } else {
-        DWORD err_code = GetLastError();
         error_ = bazel::windows::MakeErrorMessage(
             WSTR(__FILE__), __LINE__, L"nativeReadStream", L"", err_code);
         bytes_read = -1;
@@ -162,6 +181,7 @@ class NativeOutputStream {
 
   // Return the last error as a human-readable string and clear it.
   jstring GetLastErrorAsString(JNIEnv* env) {
+    std::lock_guard<std::mutex> lock(mutex_);
     jstring result = env->NewString(
         reinterpret_cast<const jchar*>(error_.c_str()), error_.size());
     error_ = L"";
@@ -169,9 +189,30 @@ class NativeOutputStream {
   }
 
  private:
+  DuplicateHandleResult DuplicateHandleForOperation(HANDLE* duplicate) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (closed_ || handle_ == INVALID_HANDLE_VALUE) {
+      error_ = L"";
+      return DuplicateHandleResult::kClosed;
+    }
+    if (::DuplicateHandle(GetCurrentProcess(), handle_, GetCurrentProcess(),
+                          duplicate, 0, FALSE, DUPLICATE_SAME_ACCESS)) {
+      return DuplicateHandleResult::kSuccess;
+    }
+    DWORD err_code = GetLastError();
+    error_ = bazel::windows::MakeErrorMessage(
+        WSTR(__FILE__), __LINE__, L"nativeDuplicateStreamHandle", L"",
+        err_code);
+    return DuplicateHandleResult::kError;
+  }
+
+  // Windows may reuse a HANDLE value as soon as CloseHandle returns. This lock
+  // serializes access to the owning handle. Read and peek use duplicates, so
+  // they remain valid while Close releases the owning handle.
+  std::mutex mutex_;
   HANDLE handle_;
   std::wstring error_;
-  std::atomic<bool> closed_;
+  bool closed_;
 };
 
 class NativeProcess {
